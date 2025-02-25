@@ -235,15 +235,15 @@ def get_week_keyboard(current_week):
 
 
 def get_days_keyboard(week_number):
-    """Create keyboard with day options for a specific week"""
+    """Create keyboard with day options for a specific week, excluding Sunday"""
     keyboard = []
 
     # Calculate date range for selected week
     semester_start = datetime.strptime(SEMESTER_START, "%Y-%m-%d")
     week_start = semester_start + timedelta(days=(week_number - 1) * 7)
 
-    # Show all 7 days of the week
-    for day_offset in range(7):
+    # Show only 6 days of the week (Monday through Saturday)
+    for day_offset in range(6):  # 0-5 instead of 0-6
         date = week_start + timedelta(days=day_offset)
         date_str = date.strftime("%d.%m.%Y")
         day_name = WEEKDAY_TRANSLATION[date.weekday()]
