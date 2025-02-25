@@ -16,17 +16,22 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+"""Игнорируем ВУЦ и Спорткомплекс"""
+IGNORED_BUILDINGS = ["4", "6"]
+
+
 # Constants for ConversationHandler states
 (
     SELECTING_ACTION,
     SELECT_BUILDING,
     SELECT_ROOM,
-    SELECT_DATE,
+    SELECT_WEEK,
+    SELECT_DAY,
     SELECT_TIME_START,
     SELECT_TIME_END,
     SHOW_SCHEDULE,
     FIND_AVAILABLE_ROOMS,
-) = range(8)
+) = range(9)
 
 # Weekday translation map
 WEEKDAY_TRANSLATION = {
@@ -39,11 +44,41 @@ WEEKDAY_TRANSLATION = {
     6: "воскресенье"
 }
 
+# Reverse weekday translation for converting from Russian to day number
+WEEKDAY_TO_NUMBER = {
+    "понедельник": 0,
+    "вторник": 1,
+    "среда": 2,
+    "четверг": 3,
+    "пятница": 4,
+    "суббота": 5,
+    "воскресенье": 6
+}
+
 # Path to the data file
 DATA_FILE = "occupied_rooms.json"
 
 # Global data store
 occupied_rooms = {}
+
+# Semester start date (for calculating academic weeks)
+SEMESTER_START = "2024-09-02"
+
+
+def calculate_current_academic_week():
+    """Calculate the current academic week based on semester start"""
+    today = datetime.now()
+    semester_start_date = datetime.strptime(SEMESTER_START, "%Y-%m-%d")
+
+    # Calculate days since semester start
+    delta_days = (today - semester_start_date).days
+
+    # Calculate current academic week
+    if delta_days < 0:
+        return 1  # If before semester start, return week 1
+
+    current_week = (delta_days // 7) + 1
+    return current_week
 
 
 def load_data():
@@ -114,14 +149,32 @@ def get_end_period_keyboard(start_period):
     return InlineKeyboardMarkup(keyboard)
 
 
-def get_buildings_keyboard():
-    """Create keyboard with building options"""
-    buildings = sorted(occupied_rooms.keys())
+def get_buildings_keyboard(highlight_building=None):
+    """Create keyboard with building options, with optional highlighting and proper sorting"""
+    # Получаем все корпуса и фильтруем, исключая игнорируемые
+    all_buildings = list(occupied_rooms.keys())
+    buildings = [building for building in all_buildings if building not in IGNORED_BUILDINGS]
+
+    # Sort buildings numerically (treating them as integers where possible)
+    def building_sort_key(building):
+        # Convert all buildings to strings first to ensure consistent comparison
+        building_str = str(building)
+        try:
+            # Try to convert to integer for proper numerical sorting
+            return (0, int(building_str))  # Tuple with 0 as first element for numbers
+        except ValueError:
+            # If not a number, use a tuple with 1 as first element to keep strings after numbers
+            return (1, building_str)
+
+    sorted_buildings = sorted(buildings, key=building_sort_key)
+
     keyboard = []
     row = []
-    for i, building in enumerate(buildings):
-        row.append(InlineKeyboardButton(building, callback_data=f"building_{building}"))
-        if (i + 1) % 3 == 0 or i == len(buildings) - 1:  # 3 buttons per row
+    for i, building in enumerate(sorted_buildings):
+        # Add ✓ symbol to the previously selected building
+        label = f"✓ {building}" if building == highlight_building else building
+        row.append(InlineKeyboardButton(label, callback_data=f"building_{building}"))
+        if (i + 1) % 3 == 0 or i == len(sorted_buildings) - 1:  # 3 buttons per row
             keyboard.append(row)
             row = []
 
@@ -154,24 +207,61 @@ def get_rooms_keyboard(building):
     return InlineKeyboardMarkup(keyboard)
 
 
-def get_date_keyboard():
-    """Create keyboard with date options (next 7 days)"""
+def get_week_keyboard(current_week):
+    """Create keyboard for selecting academic week"""
     keyboard = []
-    today = datetime.now()
 
-    for i in range(7):
-        date = today + timedelta(days=i)
-        date_str = date.strftime("%d.%m.%Y")
-        day_name = WEEKDAY_TRANSLATION[date.weekday()]
-        label = f"{date_str} ({day_name})"
-        keyboard.append([InlineKeyboardButton(label, callback_data=f"date_{date.strftime('%Y-%m-%d')}")])
+    # Add navigation row first with current week indicator
+    nav_row = [
+        InlineKeyboardButton("⬅️", callback_data=f"week_prev_{current_week}"),
+        InlineKeyboardButton(f"Неделя {current_week}", callback_data=f"week_{current_week}"),
+        InlineKeyboardButton("➡️", callback_data=f"week_next_{current_week}")
+    ]
+    keyboard.append(nav_row)
+
+    # Add weeks around current week (2 before and 2 after if possible)
+    weeks_row = []
+    for week_num in range(max(1, current_week - 2), current_week + 3):
+        if week_num != current_week:  # Skip current week as it's already in nav row
+            weeks_row.append(InlineKeyboardButton(str(week_num), callback_data=f"week_{week_num}"))
+
+    # Add weeks in a single row
+    if weeks_row:
+        keyboard.append(weeks_row)
 
     # Add cancel button
     keyboard.append([InlineKeyboardButton("Отмена", callback_data="cancel")])
     return InlineKeyboardMarkup(keyboard)
 
 
-def get_academic_week(date_str, semester_start="2024-09-02"):
+def get_days_keyboard(week_number):
+    """Create keyboard with day options for a specific week"""
+    keyboard = []
+
+    # Calculate date range for selected week
+    semester_start = datetime.strptime(SEMESTER_START, "%Y-%m-%d")
+    week_start = semester_start + timedelta(days=(week_number - 1) * 7)
+
+    # Show all 7 days of the week
+    for day_offset in range(7):
+        date = week_start + timedelta(days=day_offset)
+        date_str = date.strftime("%d.%m.%Y")
+        day_name = WEEKDAY_TRANSLATION[date.weekday()]
+        label = f"{date_str} ({day_name})"
+
+        # Store both weekday name and date in callback data
+        callback_data = f"day_{day_name}_{date.strftime('%Y-%m-%d')}"
+        keyboard.append([InlineKeyboardButton(label, callback_data=callback_data)])
+
+    # Add back and cancel buttons
+    keyboard.append([
+        InlineKeyboardButton("⬅️ Назад к выбору недели", callback_data="back_to_weeks"),
+        InlineKeyboardButton("Отмена", callback_data="cancel")
+    ])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def get_academic_week(date_str, semester_start=SEMESTER_START):
     """Calculate academic week number from a date"""
     date_obj = datetime.strptime(date_str, "%Y-%m-%d")
     semester_start_date = datetime.strptime(semester_start, "%Y-%m-%d")
@@ -183,10 +273,12 @@ def get_academic_week(date_str, semester_start="2024-09-02"):
     return (delta_days // 7) + 1
 
 
-def get_schedule_for_day(building_name, room_name, date_str):
+def get_schedule_for_day(building_name, room_name, date_str, academic_week=None):
     """Get schedule for a specific room on a specific date"""
-    week = get_academic_week(date_str)
-    if week is None:
+    if academic_week is None:
+        academic_week = get_academic_week(date_str)
+
+    if academic_week is None:
         return f"Дата {date_str} находится до начала семестра."
 
     date_obj = datetime.strptime(date_str, "%Y-%m-%d")
@@ -205,17 +297,35 @@ def get_schedule_for_day(building_name, room_name, date_str):
     # Filter lessons by week and weekday
     filtered_lessons = [
         lesson for lesson in room_schedule
-        if lesson["weekday"] == weekday and lesson["week"] == week
+        if lesson["weekday"] == weekday and lesson["week"] == academic_week
     ]
 
+    # Deduplicate lessons based on time, discipline, groups and teachers
+    unique_lessons = []
+    seen_lessons = set()
+
+    for lesson in filtered_lessons:
+        # Create a unique key for each lesson based on its contents
+        lesson_key = (
+            lesson["begin_time"],
+            lesson["end_time"],
+            lesson["discipline"],
+            tuple(sorted(lesson["groups"])),
+            tuple(sorted(lesson["teacher"]))
+        )
+
+        if lesson_key not in seen_lessons:
+            seen_lessons.add(lesson_key)
+            unique_lessons.append(lesson)
+
     # Sort lessons by begin time
-    sorted_lessons = sorted(filtered_lessons, key=lambda lesson: lesson["begin_time"])
+    sorted_lessons = sorted(unique_lessons, key=lambda lesson: lesson["begin_time"])
 
     # Format schedule message
     date_formatted = datetime.strptime(date_str, "%Y-%m-%d").strftime("%d.%m.%Y")
     result = f"📅 Расписание аудитории {room_name} ({building_name} корпус)\n"
     result += f"🗓️ Дата: {date_formatted} ({weekday})\n"
-    result += f"📊 Учебная неделя: {week}\n\n"
+    result += f"📊 Учебная неделя: {academic_week}\n\n"
 
     if not sorted_lessons:
         result += "🕓 На этот день занятий нет."
@@ -230,10 +340,12 @@ def get_schedule_for_day(building_name, room_name, date_str):
     return result
 
 
-def find_available_rooms(building_name, date_str, start_time, end_time=None):
+def find_available_rooms(building_name, date_str, start_time, end_time=None, academic_week=None):
     """Find available rooms in a building at a specific time range"""
-    week = get_academic_week(date_str)
-    if week is None:
+    if academic_week is None:
+        academic_week = get_academic_week(date_str)
+
+    if academic_week is None:
         return f"Дата {date_str} находится до начала семестра."
 
     date_obj = datetime.strptime(date_str, "%Y-%m-%d")
@@ -258,7 +370,7 @@ def find_available_rooms(building_name, date_str, start_time, end_time=None):
         is_room_available = True
 
         for lesson in room_schedule:
-            if lesson["weekday"] == weekday and lesson["week"] == week:
+            if lesson["weekday"] == weekday and lesson["week"] == academic_week:
                 lesson_begin = datetime.strptime(lesson["begin_time"], "%H:%M")
                 lesson_end = datetime.strptime(lesson["end_time"], "%H:%M")
 
@@ -276,6 +388,7 @@ def find_available_rooms(building_name, date_str, start_time, end_time=None):
     date_formatted = datetime.strptime(date_str, "%Y-%m-%d").strftime("%d.%m.%Y")
     result = f"🔍 Свободные аудитории в {building_name} корпусе\n"
     result += f"📅 Дата: {date_formatted} ({weekday})\n"
+    result += f"📊 Учебная неделя: {academic_week}\n"
     result += f"⏰ Время: {start_time}"
     if end_time:
         result += f" - {end_time}"
@@ -308,10 +421,12 @@ def find_available_rooms(building_name, date_str, start_time, end_time=None):
     return result
 
 
-def find_available_rooms_for_period_range(building_name, date_str, start_period, end_period):
+def find_available_rooms_for_period_range(building_name, date_str, start_period, end_period, academic_week=None):
     """Find rooms available for the entire period range from start_period to end_period"""
-    week = get_academic_week(date_str)
-    if week is None:
+    if academic_week is None:
+        academic_week = get_academic_week(date_str)
+
+    if academic_week is None:
         return f"Дата {date_str} находится до начала семестра."
 
     date_obj = datetime.strptime(date_str, "%Y-%m-%d")
@@ -338,7 +453,7 @@ def find_available_rooms_for_period_range(building_name, date_str, start_period,
         is_room_available = True
 
         for lesson in room_schedule:
-            if lesson["weekday"] == weekday and lesson["week"] == week:
+            if lesson["weekday"] == weekday and lesson["week"] == academic_week:
                 lesson_begin = datetime.strptime(lesson["begin_time"], "%H:%M")
                 lesson_end = datetime.strptime(lesson["end_time"], "%H:%M")
 
@@ -357,6 +472,7 @@ def find_available_rooms_for_period_range(building_name, date_str, start_period,
     date_formatted = datetime.strptime(date_str, "%Y-%m-%d").strftime("%d.%m.%Y")
     result = f"🔍 Свободные аудитории в {building_name} корпусе\n"
     result += f"📅 Дата: {date_formatted} ({weekday})\n"
+    result += f"📊 Учебная неделя: {academic_week}\n"
     result += f"⏰ Время: с {start_time} до {end_time} ({start_period}-{end_period} пары)\n\n"
 
     if available_rooms:
@@ -389,9 +505,19 @@ def find_available_rooms_for_period_range(building_name, date_str, start_period,
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Start the conversation."""
     user = update.effective_user
+    user_id = update.effective_user.id
 
-    # Reset user data for a new session
+    # Preserve the last building if it exists
+    last_building = None
+    if 'building' in context.user_data:
+        last_building = context.user_data['building']
+
+    # Reset user data for a new session but keep the last building
     context.user_data.clear()
+
+    # Restore the last building
+    if last_building:
+        context.user_data['last_building'] = last_building
 
     keyboard = [
         ["1. Посмотреть расписание аудитории"],
@@ -402,7 +528,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text(
         f"Привет, {user.first_name}! 👋\n\n"
         "Я помогу тебе найти информацию о расписании аудиторий.\n"
-        "/help - вывести подсказку.\n"
         "Выбери, что ты хочешь сделать:",
         reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
     )
@@ -414,28 +539,58 @@ async def select_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     """Handle action selection."""
     text = update.message.text
 
+    # Check if we have a last building
+    has_last_building = 'last_building' in context.user_data
+
     if text.startswith("1."):
         context.user_data["action"] = "view_schedule"
-        await update.message.reply_text(
-            "Выбери корпус:",
-            reply_markup=get_buildings_keyboard()
-        )
+
+        if has_last_building:
+            last_building = context.user_data['last_building']
+            await update.message.reply_text(
+                f"В прошлый раз вы выбирали корпус {last_building}.\n"
+                f"Выберите корпус:",
+                reply_markup=get_buildings_keyboard(last_building)
+            )
+        else:
+            await update.message.reply_text(
+                "Выбери корпус:",
+                reply_markup=get_buildings_keyboard()
+            )
         return SELECT_BUILDING
 
     elif text.startswith("2."):
         context.user_data["action"] = "find_available_moment"
-        await update.message.reply_text(
-            "Выбери корпус для поиска свободной аудитории на одну пару:",
-            reply_markup=get_buildings_keyboard()
-        )
+
+        if has_last_building:
+            last_building = context.user_data['last_building']
+            await update.message.reply_text(
+                f"В прошлый раз вы выбирали корпус {last_building}.\n"
+                f"Выберите корпус для поиска свободной аудитории на одну пару:",
+                reply_markup=get_buildings_keyboard(last_building)
+            )
+        else:
+            await update.message.reply_text(
+                "Выбери корпус для поиска свободной аудитории на одну пару:",
+                reply_markup=get_buildings_keyboard()
+            )
         return SELECT_BUILDING
 
     elif text.startswith("3."):
         context.user_data["action"] = "find_available_range"
-        await update.message.reply_text(
-            "Выбери корпус для поиска свободной аудитории на несколько пар подряд:",
-            reply_markup=get_buildings_keyboard()
-        )
+
+        if has_last_building:
+            last_building = context.user_data['last_building']
+            await update.message.reply_text(
+                f"В прошлый раз вы выбирали корпус {last_building}.\n"
+                f"Выберите корпус для поиска свободной аудитории на несколько пар подряд:",
+                reply_markup=get_buildings_keyboard(last_building)
+            )
+        else:
+            await update.message.reply_text(
+                "Выбери корпус для поиска свободной аудитории на несколько пар подряд:",
+                reply_markup=get_buildings_keyboard()
+            )
         return SELECT_BUILDING
 
     else:
@@ -465,11 +620,15 @@ async def select_building(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return SELECT_ROOM
     else:
+        # Get current academic week
+        current_week = calculate_current_academic_week()
+        context.user_data["current_week"] = current_week
+
         await query.edit_message_text(
-            f"Выбран корпус: {building_id}\nВыбери дату:",
-            reply_markup=get_date_keyboard()
+            f"Выбран корпус: {building_id}\nВыбери учебную неделю:",
+            reply_markup=get_week_keyboard(current_week)
         )
-        return SELECT_DATE
+        return SELECT_WEEK
 
 
 async def select_room(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -492,15 +651,19 @@ async def select_room(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     room_id = query.data.split("_")[1]
     context.user_data["room"] = room_id
 
+    # Get current academic week
+    current_week = calculate_current_academic_week()
+    context.user_data["current_week"] = current_week
+
     await query.edit_message_text(
-        f"Выбрана аудитория: {room_id}\nТеперь выбери дату:",
-        reply_markup=get_date_keyboard()
+        f"Выбрана аудитория: {room_id}\nТеперь выбери учебную неделю:",
+        reply_markup=get_week_keyboard(current_week)
     )
-    return SELECT_DATE
+    return SELECT_WEEK
 
 
-async def select_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle date selection."""
+async def select_week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle week selection and navigation."""
     query = update.callback_query
     await query.answer()
 
@@ -508,28 +671,87 @@ async def select_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         await query.edit_message_text("Операция отменена.")
         return ConversationHandler.END
 
-    # Extract date from callback data
-    date = query.data.split("_")[1]
-    context.user_data["date"] = date
+    parts = query.data.split("_")
+    action = parts[1]
+
+    if action == "prev":
+        # Handle previous week button
+        current_week = int(parts[2])
+        new_week = max(1, current_week - 1)
+
+        await query.edit_message_text(
+            "Выбери учебную неделю:",
+            reply_markup=get_week_keyboard(new_week)
+        )
+        return SELECT_WEEK
+
+    elif action == "next":
+        # Handle next week button
+        current_week = int(parts[2])
+        new_week = current_week + 1
+
+        await query.edit_message_text(
+            "Выбери учебную неделю:",
+            reply_markup=get_week_keyboard(new_week)
+        )
+        return SELECT_WEEK
+
+    else:
+        # Week selected
+        week_number = int(parts[1])
+        context.user_data["academic_week"] = week_number
+
+        await query.edit_message_text(
+            f"Выбрана учебная неделя: {week_number}\nТеперь выбери день недели:",
+            reply_markup=get_days_keyboard(week_number)
+        )
+        return SELECT_DAY
+
+
+async def select_day(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle day selection."""
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "cancel":
+        await query.edit_message_text("Операция отменена.")
+        return ConversationHandler.END
+
+    if query.data == "back_to_weeks":
+        current_week = context.user_data.get("current_week", calculate_current_academic_week())
+        await query.edit_message_text(
+            "Выбери учебную неделю:",
+            reply_markup=get_week_keyboard(current_week)
+        )
+        return SELECT_WEEK
+
+    # Extract date info from callback data (format: day_weekday_YYYY-MM-DD)
+    parts = query.data.split("_")
+    weekday = parts[1]
+    date_str = parts[2]
+
+    context.user_data["weekday"] = weekday
+    context.user_data["date"] = date_str
+
+    academic_week = context.user_data["academic_week"]
 
     if context.user_data["action"] == "view_schedule":
         # Show schedule directly
         building = context.user_data["building"]
         room = context.user_data["room"]
 
-        schedule = get_schedule_for_day(building, room, date)
+        schedule = get_schedule_for_day(building, room, date_str, academic_week)
         result_text = schedule + "\n\n👉 Нажмите /start чтобы начать новый поиск"
         await query.edit_message_text(result_text)
         return ConversationHandler.END
     else:
         # Format date for display
-        date_obj = datetime.strptime(date, "%Y-%m-%d")
+        date_obj = datetime.strptime(date_str, "%Y-%m-%d")
         date_formatted = date_obj.strftime("%d.%m.%Y")
-        weekday = WEEKDAY_TRANSLATION[date_obj.weekday()]
 
         # Ask for start time
         await query.edit_message_text(
-            f"Выбрана дата: {date_formatted} ({weekday})\n"
+            f"Выбрана дата: {date_formatted} ({weekday}), неделя {academic_week}\n"
             f"Выбери пару или время:",
             reply_markup=get_time_keyboard()
         )
@@ -555,6 +777,8 @@ async def select_time_start(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         end_time = parts[2]
         context.user_data["class_end_time"] = end_time  # Store class period end time separately
 
+    academic_week = context.user_data["academic_week"]
+
     if context.user_data["action"] == "find_available_moment":
         # For single time check, use start and end time of selected class period
         building = context.user_data["building"]
@@ -562,9 +786,9 @@ async def select_time_start(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
         if len(parts) > 2:
             end_time = parts[2]
-            available_rooms = find_available_rooms(building, date, start_time, end_time)
+            available_rooms = find_available_rooms(building, date, start_time, end_time, academic_week)
         else:
-            available_rooms = find_available_rooms(building, date, start_time)
+            available_rooms = find_available_rooms(building, date, start_time, None, academic_week)
 
         result_text = available_rooms + "\n\n👉 Нажмите /start чтобы начать новый поиск"
         await query.edit_message_text(result_text)
@@ -608,9 +832,10 @@ async def select_time_end(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         building = context.user_data["building"]
         date = context.user_data["date"]
+        academic_week = context.user_data["academic_week"]
 
         # Use the specialized function for period range search
-        result = find_available_rooms_for_period_range(building, date, start_period, end_period)
+        result = find_available_rooms_for_period_range(building, date, start_period, end_period, academic_week)
         result_text = result + "\n\n👉 Нажмите /start чтобы начать новый поиск"
         await query.edit_message_text(result_text)
         return ConversationHandler.END
@@ -640,8 +865,9 @@ async def select_time_end(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         building = context.user_data["building"]
         date = context.user_data["date"]
         start_time_str = context.user_data["start_time"]
+        academic_week = context.user_data["academic_week"]
 
-        available_rooms = find_available_rooms(building, date, start_time_str, time)
+        available_rooms = find_available_rooms(building, date, start_time_str, time, academic_week)
         result_text = available_rooms + "\n\n👉 Нажмите /start чтобы начать новый поиск"
         await query.edit_message_text(result_text)
         return ConversationHandler.END
@@ -669,13 +895,15 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/help - Показать это сообщение\n\n"
 
         "*Что умеет этот бот:*\n"
-        "1️⃣ Показывать расписание для конкретной аудитории на выбранную дату\n"
+        "1️⃣ Показывать расписание для конкретной аудитории на выбранную дату и неделю\n"
         "2️⃣ Находить свободные аудитории в корпусе на одну пару\n"
         "3️⃣ Находить свободные аудитории в корпусе на несколько пар подряд\n\n"
 
         "*Как пользоваться:*\n"
         "- Нажмите /start и выберите нужный вариант\n"
         "- Следуйте инструкциям бота, выбирая опции из предложенных кнопок\n"
+        "- Сначала выберите корпус, затем учебную неделю, затем день недели\n"
+        "- Для навигации по неделям используйте стрелки ⬅️ и ➡️\n"
         "- В любой момент можно отменить операцию, нажав кнопку 'Отмена'\n"
         "- После получения результата, нажмите /start чтобы начать новый поиск\n\n"
 
@@ -709,7 +937,8 @@ def main() -> None:
             SELECTING_ACTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, select_action)],
             SELECT_BUILDING: [CallbackQueryHandler(select_building)],
             SELECT_ROOM: [CallbackQueryHandler(select_room)],
-            SELECT_DATE: [CallbackQueryHandler(select_date)],
+            SELECT_WEEK: [CallbackQueryHandler(select_week)],
+            SELECT_DAY: [CallbackQueryHandler(select_day)],
             SELECT_TIME_START: [CallbackQueryHandler(select_time_start)],
             SELECT_TIME_END: [CallbackQueryHandler(select_time_end)],
         },
