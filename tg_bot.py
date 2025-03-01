@@ -19,7 +19,6 @@ logger = logging.getLogger(__name__)
 """Игнорируем ВУЦ и Спорткомплекс"""
 IGNORED_BUILDINGS = ["4", "6"]
 
-
 # Constants for ConversationHandler states
 (
     SELECTING_ACTION,
@@ -30,8 +29,9 @@ IGNORED_BUILDINGS = ["4", "6"]
     SELECT_TIME_START,
     SELECT_TIME_END,
     SHOW_SCHEDULE,
+    HANDLE_RESULTS,
     FIND_AVAILABLE_ROOMS,
-) = range(9)
+) = range(10)
 
 # Weekday translation map
 WEEKDAY_TRANSLATION = {
@@ -64,6 +64,19 @@ occupied_rooms = {}
 # Semester start date (for calculating academic weeks)
 SEMESTER_START = "2024-09-02"
 
+async def commands_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show available commands when /commands is issued."""
+    commands_text = (
+        "📋 *Доступные команды бота:*\n\n"
+        "/start - Начать работу с ботом\n"
+        "/menu - Показать главное меню\n"
+        "/help - Подробная справка по использованию\n"
+        "/commands - Показать эту справку по командам\n"
+        "/cancel - Отменить текущую операцию\n\n"
+
+        "💡 *Совет:* Эти команды также доступны в меню бота (нажмите на значок '/' в поле ввода)"
+    )
+    await update.message.reply_text(commands_text, parse_mode="Markdown")
 
 def calculate_current_academic_week():
     """Calculate the current academic week based on semester start"""
@@ -502,6 +515,38 @@ def find_available_rooms_for_period_range(building_name, date_str, start_period,
     return result
 
 
+# Новая функция для создания клавиатуры после отображения результатов
+def get_results_keyboard(context):
+    """Create keyboard with navigation options after showing results."""
+    keyboard = []
+
+    # Опции зависят от текущего действия
+    action = context.user_data.get("action", "")
+
+    if action == "view_schedule":
+        # Для просмотра расписания аудитории
+        keyboard.append([
+            InlineKeyboardButton("📅 Другой день", callback_data="different_day"),
+            InlineKeyboardButton("🚪 Другая аудитория", callback_data="different_room")
+        ])
+        keyboard.append([
+            InlineKeyboardButton("🏢 Другой корпус", callback_data="different_building"),
+            InlineKeyboardButton("🔄 Новый поиск", callback_data="new_search")
+        ])
+    else:
+        # Для поиска свободных аудиторий
+        keyboard.append([
+            InlineKeyboardButton("📅 Другой день", callback_data="different_day"),
+            InlineKeyboardButton("⏰ Другое время", callback_data="different_time")
+        ])
+        keyboard.append([
+            InlineKeyboardButton("🏢 Другой корпус", callback_data="different_building"),
+            InlineKeyboardButton("🔄 Новый поиск", callback_data="new_search")
+        ])
+
+    return InlineKeyboardMarkup(keyboard)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Start the conversation."""
     user = update.effective_user
@@ -522,7 +567,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     keyboard = [
         ["1. Посмотреть расписание аудитории"],
         ["2. Найти свободные аудитории (на одну пару)"],
-        #["3. Найти свободные аудитории (на несколько пар)"]
+        ["3. Найти свободные аудитории (на несколько пар)"]  # Раскомментировано
     ]
 
     await update.message.reply_text(
@@ -741,9 +786,13 @@ async def select_day(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         room = context.user_data["room"]
 
         schedule = get_schedule_for_day(building, room, date_str, academic_week)
-        result_text = schedule + "\n\n👉 Нажмите /start чтобы начать новый поиск"
-        await query.edit_message_text(result_text)
-        return ConversationHandler.END
+
+        # Вместо завершения диалога, предоставляем варианты навигации
+        await query.edit_message_text(
+            schedule,
+            reply_markup=get_results_keyboard(context)
+        )
+        return HANDLE_RESULTS
     else:
         # Format date for display
         date_obj = datetime.strptime(date_str, "%Y-%m-%d")
@@ -790,9 +839,12 @@ async def select_time_start(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         else:
             available_rooms = find_available_rooms(building, date, start_time, None, academic_week)
 
-        result_text = available_rooms + "\n\n👉 Нажмите /start чтобы начать новый поиск"
-        await query.edit_message_text(result_text)
-        return ConversationHandler.END
+        # Добавляем клавиатуру с навигацией вместо завершения диалога
+        await query.edit_message_text(
+            available_rooms,
+            reply_markup=get_results_keyboard(context)
+        )
+        return HANDLE_RESULTS
     else:
         # For time range, ask for end class period
         # Store which class period was selected (extract number from label for later display)
@@ -823,8 +875,8 @@ async def select_time_end(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     parts = query.data.split("_")
 
     # Handle end period selection (for third option)
-    if parts[0] == "end_period":
-        end_period = int(parts[1])
+    if parts[0] == "end":
+        end_period = int(parts[2])
         context.user_data["end_period"] = end_period
 
         # Get start period
@@ -834,11 +886,24 @@ async def select_time_end(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         date = context.user_data["date"]
         academic_week = context.user_data["academic_week"]
 
+        # Проверка на корректность диапазона
+        if end_period < start_period:
+            await query.edit_message_text(
+                "Ошибка: конечная пара не может быть раньше начальной пары.\n"
+                "Пожалуйста, выберите конечную пару снова:",
+                reply_markup=get_end_period_keyboard(start_period)
+            )
+            return SELECT_TIME_END
+
         # Use the specialized function for period range search
         result = find_available_rooms_for_period_range(building, date, start_period, end_period, academic_week)
-        result_text = result + "\n\n👉 Нажмите /start чтобы начать новый поиск"
-        await query.edit_message_text(result_text)
-        return ConversationHandler.END
+
+        # Добавляем клавиатуру с навигацией
+        await query.edit_message_text(
+            result,
+            reply_markup=get_results_keyboard(context)
+        )
+        return HANDLE_RESULTS
 
     # Handle normal time selection
     else:
@@ -868,9 +933,102 @@ async def select_time_end(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         academic_week = context.user_data["academic_week"]
 
         available_rooms = find_available_rooms(building, date, start_time_str, time, academic_week)
-        result_text = available_rooms + "\n\n👉 Нажмите /start чтобы начать новый поиск"
-        await query.edit_message_text(result_text)
-        return ConversationHandler.END
+
+        # Добавляем клавиатуру с навигацией
+        await query.edit_message_text(
+            available_rooms,
+            reply_markup=get_results_keyboard(context)
+        )
+        return HANDLE_RESULTS
+
+
+# Новый обработчик для навигации после отображения результатов
+async def handle_results_navigation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle navigation from results screen."""
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "new_search":
+        # Начать новый поиск, сохраняя последний корпус
+        if 'building' in context.user_data:
+            last_building = context.user_data['building']
+            context.user_data.clear()
+            context.user_data['last_building'] = last_building
+        else:
+            context.user_data.clear()
+
+        # Сначала удаляем inline кнопки из текущего сообщения
+        await query.edit_message_text(
+            "Начинаем новый поиск...",
+            reply_markup=None
+        )
+
+        # Затем отправляем новое сообщение с обычными кнопками
+        keyboard = [
+            ["1. Посмотреть расписание аудитории"],
+            ["2. Найти свободные аудитории (на одну пару)"],
+            ["3. Найти свободные аудитории (на несколько пар)"]
+        ]
+
+        await query.message.reply_text(
+            "Выбери, что ты хочешь сделать:",
+            reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
+        )
+        return SELECTING_ACTION
+
+    elif query.data == "different_day":
+        # Показать выбор другого дня, сохраняя контекст корпуса/аудитории
+        academic_week = context.user_data.get("academic_week", calculate_current_academic_week())
+
+        await query.edit_message_text(
+            "Выбери день недели:",
+            reply_markup=get_days_keyboard(academic_week)
+        )
+        return SELECT_DAY
+
+    elif query.data == "different_room":
+        # Показать выбор другой аудитории, сохраняя контекст корпуса
+        building = context.user_data["building"]
+
+        await query.edit_message_text(
+            f"Выбери аудиторию в корпусе {building}:",
+            reply_markup=get_rooms_keyboard(building)
+        )
+        return SELECT_ROOM
+
+    elif query.data == "different_building":
+        # Показать выбор другого корпуса
+        current_building = context.user_data.get("building")
+
+        await query.edit_message_text(
+            "Выбери корпус:",
+            reply_markup=get_buildings_keyboard(current_building)
+        )
+        return SELECT_BUILDING
+
+    elif query.data == "different_time":
+        # Вернуться к выбору времени, сохраняя контекст корпуса/дня
+        date_str = context.user_data.get("date")
+        weekday = context.user_data.get("weekday")
+        academic_week = context.user_data.get("academic_week")
+
+        if date_str and weekday and academic_week:
+            date_obj = datetime.strptime(date_str, "%Y-%m-%d")
+            date_formatted = date_obj.strftime("%d.%m.%Y")
+
+            await query.edit_message_text(
+                f"Выбрана дата: {date_formatted} ({weekday}), неделя {academic_week}\n"
+                f"Выбери пару или время:",
+                reply_markup=get_time_keyboard()
+            )
+            return SELECT_TIME_START
+        else:
+            # Если почему-то данные отсутствуют, начать заново
+            await query.edit_message_text(
+                "Произошла ошибка. Пожалуйста, начните поиск заново.",
+                reply_markup=None
+            )
+            return ConversationHandler.END
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -886,13 +1044,44 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 
+async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Display the main menu when /menu command is issued."""
+    user = update.effective_user
+
+    # Сохраняем последний корпус
+    last_building = None
+    if 'building' in context.user_data:
+        last_building = context.user_data['building']
+
+    # Очищаем данные пользователя, но сохраняем последний корпус
+    context.user_data.clear()
+    if last_building:
+        context.user_data['last_building'] = last_building
+
+    keyboard = [
+        ["1. Посмотреть расписание аудитории"],
+        ["2. Найти свободные аудитории (на одну пару)"],
+        ["3. Найти свободные аудитории (на несколько пар)"]
+    ]
+
+    await update.message.reply_text(
+        f"Главное меню 📋\n\n"
+        "Выбери, что ты хочешь сделать:",
+        reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
+    )
+
+    return SELECTING_ACTION
+
+
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Send a message when the command /help is issued."""
     help_text = (
         "🤖 *Помощь по использованию бота*\n\n"
         "*Доступные команды:*\n"
         "/start - Начать работу с ботом\n"
-        "/help - Показать это сообщение\n\n"
+        "/menu - Показать главное меню (можно использовать в любой момент)\n"
+        "/help - Показать это сообщение\n"
+        "/cancel - Отменить текущую операцию\n\n"
 
         "*Что умеет этот бот:*\n"
         "1️⃣ Показывать расписание для конкретной аудитории на выбранную дату и неделю\n"
@@ -900,12 +1089,19 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "3️⃣ Находить свободные аудитории в корпусе на несколько пар подряд\n\n"
 
         "*Как пользоваться:*\n"
-        "- Нажмите /start и выберите нужный вариант\n"
+        "- Используйте /start или /menu для вызова главного меню\n"
+        "- Выберите нужный вариант поиска (1, 2 или 3)\n"
         "- Следуйте инструкциям бота, выбирая опции из предложенных кнопок\n"
         "- Сначала выберите корпус, затем учебную неделю, затем день недели\n"
-        "- Для навигации по неделям используйте стрелки ⬅️ и ➡️\n"
-        "- В любой момент можно отменить операцию, нажав кнопку 'Отмена'\n"
-        "- После получения результата, нажмите /start чтобы начать новый поиск\n\n"
+        "- Для навигации по неделям используйте стрелки ⬅️ и ➡️\n\n"
+
+        "*Навигация после получения результатов:*\n"
+        "После каждого результата поиска вам предлагаются кнопки для продолжения:\n"
+        "- 📅 *Другой день* - посмотреть информацию для другого дня (в том же корпусе/аудитории)\n"
+        "- 🚪 *Другая аудитория* - выбрать другую аудиторию в том же корпусе\n"
+        "- 🏢 *Другой корпус* - выбрать другой корпус\n"
+        "- ⏰ *Другое время* - выбрать другое время для поиска свободных аудиторий\n"
+        "- 🔄 *Новый поиск* - начать новый поиск с главного меню\n\n"
 
         "*Расписание пар:*\n"
         "1 пара: 08:00-09:35\n"
@@ -917,9 +1113,35 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "7 пара: 18:45-20:20\n"
         "8 пара: 20:30-22:05\n\n"
 
+        "*Советы:*\n"
+        "- Бот запоминает последний выбранный корпус для более быстрого поиска\n"
+        "- Используйте команду /menu вместо /start для быстрого доступа к главному меню\n"
+        "- При поиске аудитории на несколько пар, сначала выберите начальную пару, затем конечную\n"
+        "- Все команды доступны в меню бота (нажмите на значок '/' в поле ввода)\n"
+        "- Используйте /commands для быстрого просмотра списка команд\n\n"
+
         "Удачного поиска аудиторий! 📚"
     )
     await update.message.reply_text(help_text, parse_mode="Markdown")
+
+
+async def setup_commands(application: Application) -> None:
+    """Setup bot commands in Telegram UI."""
+    commands = [
+        ("start", "Начать работу с ботом"),
+        ("menu", "Главное меню"),
+        ("help", "Помощь и инструкции"),
+        ("commands", "Список доступных команд"),
+        ("cancel", "Отменить текущую операцию")
+    ]
+
+    await application.bot.set_my_commands(commands)
+    logger.info("Bot commands have been set up")
+
+
+async def post_init(application: Application) -> None:
+    """Actions to execute once the bot has started."""
+    await setup_commands(application)
 
 
 def main() -> None:
@@ -927,12 +1149,15 @@ def main() -> None:
     # Load data from file
     load_data()
 
-    # Create the Application using environment variable
-    application = Application.builder().token(os.getenv("BOT_TOKEN")).build()
+    # Create the Application using environment variable with post_init callback
+    application = Application.builder().token(os.getenv("BOT_TOKEN")).post_init(post_init).build()
 
-    # Add conversation handler
+    # Add conversation handler with expanded states
     conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
+        entry_points=[
+            CommandHandler("start", start),
+            CommandHandler("menu", menu_command),
+        ],
         states={
             SELECTING_ACTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, select_action)],
             SELECT_BUILDING: [CallbackQueryHandler(select_building)],
@@ -941,12 +1166,17 @@ def main() -> None:
             SELECT_DAY: [CallbackQueryHandler(select_day)],
             SELECT_TIME_START: [CallbackQueryHandler(select_time_start)],
             SELECT_TIME_END: [CallbackQueryHandler(select_time_end)],
+            HANDLE_RESULTS: [CallbackQueryHandler(handle_results_navigation)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            CommandHandler("menu", menu_command),
+        ],
     )
 
     application.add_handler(conv_handler)
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("commands", commands_command))
 
     # Run the bot until the user presses Ctrl-C
     print("Bot started!")
