@@ -1,11 +1,13 @@
 import logging
 import json
 import os
+import asyncio
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, \
     ConversationHandler, filters
 from dotenv import load_dotenv
+from db_model import Database
 
 # Load environment variables
 load_dotenv()
@@ -15,6 +17,17 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+# Initialize database
+db = Database()
+
+# Load admin IDs from environment variable
+ADMIN_IDS = [int(admin_id.strip()) for admin_id in os.getenv("ADMIN_IDS", "").split(",") if admin_id.strip()]
+for admin_id in ADMIN_IDS:
+    # Ensure that admins are marked in the database
+    user = db.get_user(admin_id)
+    if user:
+        db.set_admin(admin_id, True)
 
 """Игнорируем ВУЦ и Спорткомплекс"""
 IGNORED_BUILDINGS = ["4", "6"]
@@ -31,7 +44,16 @@ IGNORED_BUILDINGS = ["4", "6"]
     SHOW_SCHEDULE,
     HANDLE_RESULTS,
     FIND_AVAILABLE_ROOMS,
-) = range(10)
+
+    # Admin states
+    ADMIN_MENU,
+    ADMIN_BROADCAST,
+    ADMIN_CONFIRM_BROADCAST,
+
+    # User settings states
+    USER_SETTINGS,
+    TOGGLE_NOTIFICATIONS,
+) = range(15)
 
 # Weekday translation map
 WEEKDAY_TRANSLATION = {
@@ -62,21 +84,45 @@ DATA_FILE = "occupied_rooms.json"
 occupied_rooms = {}
 
 # Semester start date (for calculating academic weeks)
-SEMESTER_START = "2024-09-02"
+SEMESTER_START = os.getenv("SEMESTER_START")
+
+
+# User tracking - track current user activity
+async def track_user_activity(update: Update):
+    """Update user information in database"""
+    user = update.effective_user
+    if user:
+        db.add_user(
+            user_id=user.id,
+            username=user.username or "",
+            first_name=user.first_name or "",
+            last_name=user.last_name or ""
+        )
+        db.update_user_activity(user.id)
+
 
 async def commands_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show available commands when /commands is issued."""
+    await track_user_activity(update)
+
     commands_text = (
         "📋 *Доступные команды бота:*\n\n"
         "/start - Начать работу с ботом\n"
         "/menu - Показать главное меню\n"
         "/help - Подробная справка по использованию\n"
         "/commands - Показать эту справку по командам\n"
+        "/settings - Настройки пользователя\n"
         "/cancel - Отменить текущую операцию\n\n"
 
         "💡 *Совет:* Эти команды также доступны в меню бота (нажмите на значок '/' в поле ввода)"
     )
+
+    # Add admin commands if user is admin
+    if db.is_admin(update.effective_user.id):
+        commands_text += "\n\n*Команды администратора:*\n/admin - Панель администратора\n"
+
     await update.message.reply_text(commands_text, parse_mode="Markdown")
+
 
 def calculate_current_academic_week():
     """Calculate the current academic week based on semester start"""
@@ -547,8 +593,83 @@ def get_results_keyboard(context):
     return InlineKeyboardMarkup(keyboard)
 
 
+# Функции для пользовательских настроек
+def get_settings_keyboard(user_id):
+    """Create keyboard for user settings."""
+    user = db.get_user(user_id)
+
+    # Определяем текущее состояние уведомлений
+    notifications_enabled = user and user['notifications_enabled'] == 1
+    notification_status = "🔔 Уведомления включены" if notifications_enabled else "🔕 Уведомления выключены"
+
+    keyboard = [
+        [InlineKeyboardButton(
+            "🔄 Переключить уведомления",
+            callback_data="toggle_notifications"
+        )],
+        [InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_to_menu")]
+    ]
+
+    return notification_status, InlineKeyboardMarkup(keyboard)
+
+
+# Функции для админки
+def get_admin_keyboard():
+    """Create keyboard for admin panel."""
+    keyboard = [
+        [InlineKeyboardButton("📢 Отправить уведомление всем", callback_data="broadcast")],
+        [InlineKeyboardButton("📊 Статистика пользователей", callback_data="user_stats")],
+        [InlineKeyboardButton("⬅️ Вернуться в меню", callback_data="back_to_menu")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+async def send_broadcast_message(context: ContextTypes.DEFAULT_TYPE, notification_id, skip_users=None):
+    """Send a broadcast message to all users with notifications enabled."""
+    if skip_users is None:
+        skip_users = set()
+
+    notification = db.get_notification(notification_id)
+    if not notification:
+        return 0
+
+    # Get all users with notifications enabled
+    users = db.get_all_users(with_notifications=True)
+
+    sent_count = 0
+    failed_count = 0
+
+    for user in users:
+        user_id = user['user_id']
+
+        # Skip users in the skip list
+        if user_id in skip_users:
+            continue
+
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"📢 *Объявление*\n\n{notification['text']}",
+                parse_mode="Markdown"
+            )
+            sent_count += 1
+            # Small delay to avoid hitting rate limits
+            await asyncio.sleep(0.05)
+        except Exception as e:
+            logger.error(f"Failed to send message to user {user_id}: {e}")
+            failed_count += 1
+
+    # Mark notification as sent
+    db.mark_notification_sent(notification_id)
+
+    return sent_count, failed_count
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Start the conversation."""
+    # Track user activity
+    await track_user_activity(update)
+
     user = update.effective_user
     user_id = update.effective_user.id
 
@@ -567,8 +688,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     keyboard = [
         ["1. Посмотреть расписание аудитории"],
         ["2. Найти свободные аудитории (на одну пару)"],
-        ["3. Найти свободные аудитории (на несколько пар)"]  # Раскомментировано
+        ["3. Найти свободные аудитории (на несколько пар)"]
     ]
+
+    # Add admin button for admins
+    if db.is_admin(user_id):
+        keyboard.append(["👑 Панель администратора"])
+
+    # Add settings button for all users
+    #keyboard.append(["⚙️ Настройки пользователя"])
 
     await update.message.reply_text(
         f"Привет, {user.first_name}! 👋\n\n"
@@ -582,7 +710,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 async def select_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle action selection."""
+    # Track user activity
+    await track_user_activity(update)
+
     text = update.message.text
+    user_id = update.effective_user.id
 
     # Check if we have a last building
     has_last_building = 'last_building' in context.user_data
@@ -638,6 +770,33 @@ async def select_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             )
         return SELECT_BUILDING
 
+    elif text == "👑 Панель администратора":
+        # Проверяем права администратора
+        if db.is_admin(user_id):
+            await update.message.reply_text(
+                "👑 *Панель администратора*\n\n"
+                "Выберите действие:",
+                parse_mode="Markdown",
+                reply_markup=get_admin_keyboard()
+            )
+            return ADMIN_MENU
+        else:
+            await update.message.reply_text(
+                "У вас нет прав администратора."
+            )
+            return SELECTING_ACTION
+
+    elif text == "⚙️ Настройки пользователя":
+        notification_status, keyboard = get_settings_keyboard(user_id)
+        await update.message.reply_text(
+            f"⚙️ *Настройки пользователя*\n\n"
+            f"{notification_status}\n\n"
+            f"Выберите действие:",
+            parse_mode="Markdown",
+            reply_markup=keyboard
+        )
+        return USER_SETTINGS
+
     else:
         await update.message.reply_text(
             "Пожалуйста, выбери один из вариантов, используя кнопки."
@@ -647,6 +806,10 @@ async def select_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
 async def select_building(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle building selection."""
+    # Track user activity if message is from query
+    if update.callback_query:
+        await track_user_activity(update)
+
     query = update.callback_query
     await query.answer()
 
@@ -926,7 +1089,7 @@ async def select_time_end(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             )
             return ConversationHandler.END
 
-        # Show available rooms for the time range
+            # Show available rooms for the time range
         building = context.user_data["building"]
         date = context.user_data["date"]
         start_time_str = context.user_data["start_time"]
@@ -940,7 +1103,6 @@ async def select_time_end(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             reply_markup=get_results_keyboard(context)
         )
         return HANDLE_RESULTS
-
 
 # Новый обработчик для навигации после отображения результатов
 async def handle_results_navigation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -969,6 +1131,13 @@ async def handle_results_navigation(update: Update, context: ContextTypes.DEFAUL
             ["2. Найти свободные аудитории (на одну пару)"],
             ["3. Найти свободные аудитории (на несколько пар)"]
         ]
+
+        # Add admin button for admins
+        if db.is_admin(update.effective_user.id):
+            keyboard.append(["👑 Панель администратора"])
+
+        # Add settings button for all users
+        #keyboard.append(["⚙️ Настройки пользователя"])
 
         await query.message.reply_text(
             "Выбери, что ты хочешь сделать:",
@@ -1030,6 +1199,257 @@ async def handle_results_navigation(update: Update, context: ContextTypes.DEFAUL
             )
             return ConversationHandler.END
 
+# Обработчики для управления настройками пользователя
+async def user_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle user settings command."""
+    await track_user_activity(update)
+
+    user_id = update.effective_user.id
+    notification_status, keyboard = get_settings_keyboard(user_id)
+
+    await update.message.reply_text(
+        f"⚙️ *Настройки пользователя*\n\n"
+        f"{notification_status}\n\n"
+        f"Выберите действие:",
+        parse_mode="Markdown",
+        reply_markup=keyboard
+    )
+    return USER_SETTINGS
+
+async def handle_settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle callbacks from settings menu."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = update.effective_user.id
+
+    if query.data == "toggle_notifications":
+        # Get current notification status
+        user = db.get_user(user_id)
+        current_status = user and user['notifications_enabled'] == 1
+
+        # Toggle notifications
+        db.toggle_notifications(user_id, not current_status)
+
+        # Get updated settings keyboard
+        notification_status, keyboard = get_settings_keyboard(user_id)
+
+        await query.edit_message_text(
+            f"⚙️ *Настройки пользователя*\n\n"
+            f"{notification_status}\n\n"
+            f"Настройки обновлены! Выберите действие:",
+            parse_mode="Markdown",
+            reply_markup=keyboard
+        )
+        return USER_SETTINGS
+
+    elif query.data == "back_to_menu":
+        # Return to main menu
+        keyboard = [
+            ["1. Посмотреть расписание аудитории"],
+            ["2. Найти свободные аудитории (на одну пару)"],
+            ["3. Найти свободные аудитории (на несколько пар)"]
+        ]
+
+        # Add admin button if user is admin
+        if db.is_admin(user_id):
+            keyboard.append(["👑 Панель администратора"])
+
+        # Add settings button
+        keyboard.append(["⚙️ Настройки пользователя"])
+
+        await query.edit_message_text(
+            "Выберите, что вы хотите сделать:",
+            reply_markup=None
+        )
+
+        await query.message.reply_text(
+            "Главное меню:",
+            reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
+        )
+        return SELECTING_ACTION
+
+    return USER_SETTINGS
+
+# Обработчики для админки
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle the /admin command."""
+    await track_user_activity(update)
+
+    user_id = update.effective_user.id
+
+    # Check if user is admin
+    if not db.is_admin(user_id):
+        await update.message.reply_text("У вас нет прав администратора.")
+        return ConversationHandler.END
+
+    await update.message.reply_text(
+        "👑 *Панель администратора*\n\n"
+        "Выберите действие:",
+        parse_mode="Markdown",
+        reply_markup=get_admin_keyboard()
+    )
+    return ADMIN_MENU
+
+async def handle_admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle admin panel menu selection."""
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "broadcast":
+        await query.edit_message_text(
+            "📢 *Создание объявления*\n\n"
+            "Отправьте текст объявления, которое будет разослано всем пользователям с включенными уведомлениями.",
+            parse_mode="Markdown"
+        )
+        return ADMIN_BROADCAST
+
+    elif query.data == "user_stats":
+        # Get user statistics
+        stats = db.get_user_stats()
+
+        stats_text = (
+            "📊 *Статистика пользователей*\n\n"
+            f"👥 Всего пользователей: {stats['total']}\n"
+            f"🟢 Активных за 30 дней: {stats['active_30_days']}\n"
+            f"🔔 С включенными уведомлениями: {stats['with_notifications']}\n"
+            f"👑 Администраторов: {stats['admins']}\n\n"
+        )
+
+        await query.edit_message_text(
+            stats_text,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ Назад", callback_data="back_to_admin")
+            ]])
+        )
+        return ADMIN_MENU
+
+    elif query.data == "back_to_menu":
+        # Return to main menu
+        keyboard = [
+            ["1. Посмотреть расписание аудитории"],
+            ["2. Найти свободные аудитории (на одну пару)"],
+            ["3. Найти свободные аудитории (на несколько пар)"]
+        ]
+
+        # Add admin button
+        if db.is_admin(update.effective_user.id):
+            keyboard.append(["👑 Панель администратора"])
+
+        # Add settings button
+        keyboard.append(["⚙️ Настройки пользователя"])
+
+        await query.edit_message_text(
+            "Возвращаемся в главное меню...",
+            reply_markup=None
+        )
+
+        await query.message.reply_text(
+            "Выберите, что вы хотите сделать:",
+            reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
+        )
+        return SELECTING_ACTION
+
+    elif query.data == "back_to_admin":
+        # Return to admin panel
+        await query.edit_message_text(
+            "👑 *Панель администратора*\n\n"
+            "Выберите действие:",
+            parse_mode="Markdown",
+            reply_markup=get_admin_keyboard()
+        )
+        return ADMIN_MENU
+
+    return ADMIN_MENU
+
+async def handle_broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle broadcast message input."""
+    # Check if user is still admin
+    if not db.is_admin(update.effective_user.id):
+        await update.message.reply_text("У вас нет прав администратора.")
+        return ConversationHandler.END
+
+    # Get message text
+    broadcast_text = update.message.text
+    context.user_data["broadcast_text"] = broadcast_text
+
+    # Get count of users with notifications enabled
+    users_with_notifications = db.get_all_users(with_notifications=True)
+    count = len(users_with_notifications)
+
+    # Ask for confirmation
+    await update.message.reply_text(
+        f"📢 *Предпросмотр объявления*\n\n"
+        f"{broadcast_text}\n\n"
+        f"Объявление будет отправлено {count} пользователям с включенными уведомлениями.\n"
+        f"Подтверждаете отправку?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Да, отправить", callback_data="confirm_broadcast"),
+                InlineKeyboardButton("❌ Нет, отменить", callback_data="cancel_broadcast")
+            ]
+        ])
+    )
+    return ADMIN_CONFIRM_BROADCAST
+
+async def handle_broadcast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle broadcast confirmation."""
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "confirm_broadcast":
+        # Get broadcast text
+        broadcast_text = context.user_data.get("broadcast_text", "")
+
+        if not broadcast_text:
+            await query.edit_message_text(
+                "Ошибка: текст объявления не найден. Попробуйте еще раз."
+            )
+            return ConversationHandler.END
+
+        # Save notification to database
+        notification_id = db.add_notification(broadcast_text, update.effective_user.id)
+
+        # Start sending in background
+        await query.edit_message_text("🕒 Рассылка объявления началась...")
+
+        # Send broadcast message (without waiting for completion)
+        context.application.create_task(
+            send_broadcast_and_update(context, query.message, notification_id)
+        )
+
+        return ConversationHandler.END
+
+    elif query.data == "cancel_broadcast":
+        await query.edit_message_text(
+            "✅ Рассылка объявления отменена."
+        )
+        return ConversationHandler.END
+
+    return ADMIN_CONFIRM_BROADCAST
+
+async def send_broadcast_and_update(context, message, notification_id):
+    """Send broadcast and update the status message."""
+    try:
+        sent_count, failed_count = await send_broadcast_message(context, notification_id)
+
+        total = sent_count + failed_count
+
+        # Update status message
+        await message.edit_text(
+            f"✅ Рассылка объявления завершена!\n\n"
+            f"📊 Статистика:\n"
+            f"✓ Успешно отправлено: {sent_count}\n"
+            f"✗ Ошибок: {failed_count}\n"
+            f"Всего получателей: {total}"
+        )
+    except Exception as e:
+        logger.error(f"Error during broadcast: {e}")
+        await message.edit_text(
+            f"❌ Произошла ошибка при рассылке объявления: {str(e)}"
+        )
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Cancel and end the conversation."""
@@ -1043,10 +1463,12 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     return ConversationHandler.END
 
-
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Display the main menu when /menu command is issued."""
+    await track_user_activity(update)
+
     user = update.effective_user
+    user_id = user.id
 
     # Сохраняем последний корпус
     last_building = None
@@ -1064,6 +1486,13 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         ["3. Найти свободные аудитории (на несколько пар)"]
     ]
 
+    # Add admin button if user is admin
+    if db.is_admin(user_id):
+        keyboard.append(["👑 Панель администратора"])
+
+    # Add settings button for all users
+    keyboard.append(["⚙️ Настройки пользователя"])
+
     await update.message.reply_text(
         f"Главное меню 📋\n\n"
         "Выбери, что ты хочешь сделать:",
@@ -1072,15 +1501,17 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
     return SELECTING_ACTION
 
-
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Send a message when the command /help is issued."""
+    await track_user_activity(update)
+
     help_text = (
         "🤖 *Помощь по использованию бота*\n\n"
         "*Доступные команды:*\n"
         "/start - Начать работу с ботом\n"
         "/menu - Показать главное меню (можно использовать в любой момент)\n"
         "/help - Показать это сообщение\n"
+        "/settings - Настройки пользователя\n"
         "/cancel - Отменить текущую операцию\n\n"
 
         "*Что умеет этот бот:*\n"
@@ -1113,6 +1544,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "7 пара: 18:45-20:20\n"
         "8 пара: 20:30-22:05\n\n"
 
+        "*Настройки пользователя:*\n"
+        "- В настройках вы можете включить или отключить уведомления от бота\n"
+        "- Используйте команду /settings или кнопку '⚙️ Настройки пользователя' в главном меню\n\n"
+
         "*Советы:*\n"
         "- Бот запоминает последний выбранный корпус для более быстрого поиска\n"
         "- Используйте команду /menu вместо /start для быстрого доступа к главному меню\n"
@@ -1122,8 +1557,17 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
         "Удачного поиска аудиторий! 📚"
     )
-    await update.message.reply_text(help_text, parse_mode="Markdown")
 
+    # Add admin information if user is admin
+    if db.is_admin(update.effective_user.id):
+        help_text += (
+            "\n\n*Для администраторов:*\n"
+            "- Используйте команду /admin для доступа к панели администратора\n"
+            "- В панели администратора вы можете отправлять уведомления пользователям\n"
+            "- Вы также можете просматривать статистику пользователей"
+        )
+
+    await update.message.reply_text(help_text, parse_mode="Markdown")
 
 async def setup_commands(application: Application) -> None:
     """Setup bot commands in Telegram UI."""
@@ -1131,18 +1575,29 @@ async def setup_commands(application: Application) -> None:
         ("start", "Начать работу с ботом"),
         ("menu", "Главное меню"),
         ("help", "Помощь и инструкции"),
+        ("settings", "Настройки пользователя"),
         ("commands", "Список доступных команд"),
         ("cancel", "Отменить текущую операцию")
     ]
 
+    # Add admin command for admins
+    # Note: This will be shown to all users, but only admins can use it
+    commands.append(("admin", "Панель администратора"))
+
     await application.bot.set_my_commands(commands)
     logger.info("Bot commands have been set up")
-
 
 async def post_init(application: Application) -> None:
     """Actions to execute once the bot has started."""
     await setup_commands(application)
 
+    # Mark admin users in the database
+    for admin_id in ADMIN_IDS:
+        user = db.get_user(admin_id)
+        if user:
+            db.set_admin(admin_id, True)
+
+    logger.info(f"Initialized with {len(ADMIN_IDS)} admins")
 
 def main() -> None:
     """Start the bot."""
@@ -1157,6 +1612,8 @@ def main() -> None:
         entry_points=[
             CommandHandler("start", start),
             CommandHandler("menu", menu_command),
+            CommandHandler("admin", admin_command),
+            CommandHandler("settings", user_settings),
         ],
         states={
             SELECTING_ACTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, select_action)],
@@ -1167,6 +1624,14 @@ def main() -> None:
             SELECT_TIME_START: [CallbackQueryHandler(select_time_start)],
             SELECT_TIME_END: [CallbackQueryHandler(select_time_end)],
             HANDLE_RESULTS: [CallbackQueryHandler(handle_results_navigation)],
+
+            # Admin states
+            ADMIN_MENU: [CallbackQueryHandler(handle_admin_menu)],
+            ADMIN_BROADCAST: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_broadcast_message)],
+            ADMIN_CONFIRM_BROADCAST: [CallbackQueryHandler(handle_broadcast_confirm)],
+
+            # User settings states
+            USER_SETTINGS: [CallbackQueryHandler(handle_settings_callback)],
         },
         fallbacks=[
             CommandHandler("cancel", cancel),
@@ -1181,7 +1646,6 @@ def main() -> None:
     # Run the bot until the user presses Ctrl-C
     print("Bot started!")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
-
 
 if __name__ == "__main__":
     main()
