@@ -1,5 +1,22 @@
+# Project specific
 cache/
 occupied_rooms.json
+
+# Database files (production data)
+schedule.db
+bot_data.db
+*.db-journal
+
+# Test files
+test_*.db
+test_migration.db
+
+# Temporary files
+*.tmp
+*.temp
+
+# Log files
+*.log
 
 # vs code
 .vs/
