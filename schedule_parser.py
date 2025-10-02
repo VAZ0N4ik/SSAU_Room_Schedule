@@ -27,9 +27,11 @@ BASE_URL = "https://ssau.ru/rasp"
 API_URL = "https://cabinet.ssau.ru/api/timetable/get-timetable"
 AUTH_URL = "https://cabinet.ssau.ru/login"
 CACHE_DIR = "cache"
-MAX_CONCURRENT_REQUESTS = 10  # Increased for better performance
-REQUEST_DELAY = 0.05  # Reduced delay - session is working fine
-BATCH_SIZE = 20  # Larger batch size
+MAX_CONCURRENT_REQUESTS = 30  # Maximum concurrent requests
+REQUEST_DELAY = 0.01  # Minimal delay between requests
+BATCH_SIZE = 50  # Process 50 groups at once
+CONNECTION_LIMIT = 100  # Total connection pool limit
+CONNECTION_LIMIT_PER_HOST = 30  # Per-host connection limit
 
 # Create cache directory if it doesn't exist
 os.makedirs(CACHE_DIR, exist_ok=True)
@@ -41,6 +43,7 @@ HEADERS = {
     "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
     "Accept-Encoding": "gzip, deflate, br",
     "Connection": "keep-alive",
+    "Keep-Alive": "timeout=30, max=1000",
     "Sec-Fetch-Dest": "empty",
     "Sec-Fetch-Mode": "cors",
     "Sec-Fetch-Site": "same-origin"
@@ -316,11 +319,12 @@ class ScheduleParser:
         logger.error(f"All {retries} attempts failed for {url}")
         return None
 
-    async def fetch_json(self, session: aiohttp.ClientSession, url: str, retries: int = 3) -> Optional[Dict[str, Any]]:
-        """Fetch JSON data with retries"""
+    async def fetch_json(self, session: aiohttp.ClientSession, url: str, retries: int = 2) -> Optional[Dict[str, Any]]:
+        """Fetch JSON data with retries - optimized for speed"""
         for attempt in range(retries):
             try:
-                async with session.get(url, headers=HEADERS, cookies=self.auth.get_cookies()) as response:
+                timeout = aiohttp.ClientTimeout(total=10, connect=3, sock_read=7)
+                async with session.get(url, headers=HEADERS, cookies=self.auth.get_cookies(), timeout=timeout) as response:
                     if response.status == 200:
                         return await response.json()
                     elif response.status == 401:
@@ -330,12 +334,21 @@ class ScheduleParser:
                         else:
                             logger.error("Re-authentication failed")
                             return None
+                    elif response.status == 429:  # Rate limited
+                        wait_time = min(2 ** attempt, 5)  # Max 5 seconds
+                        logger.warning(f"Rate limited, waiting {wait_time}s")
+                        await asyncio.sleep(wait_time)
+                        continue
                     else:
                         logger.warning(f"HTTP {response.status} for {url}")
+            except asyncio.TimeoutError:
+                logger.warning(f"Timeout on attempt {attempt + 1} for {url}")
+                if attempt < retries - 1:
+                    await asyncio.sleep(0.5)  # Quick retry
             except Exception as e:
                 logger.warning(f"Attempt {attempt + 1} failed for {url}: {e}")
                 if attempt < retries - 1:
-                    await asyncio.sleep(2 ** attempt)
+                    await asyncio.sleep(0.5)
 
         logger.error(f"All {retries} attempts failed for {url}")
         return None
@@ -460,7 +473,9 @@ class ScheduleParser:
                                   week: int, semaphore: asyncio.Semaphore) -> Optional[List[Dict[str, Any]]]:
         """Fetch timetable for a specific group and week"""
         async with semaphore:
-            await asyncio.sleep(REQUEST_DELAY)
+            # Minimal delay only when necessary
+            if random.random() < 0.1:  # 10% chance of delay to avoid rate limits
+                await asyncio.sleep(REQUEST_DELAY)
 
             url = f"{API_URL}?yearId={self.current_year_id}&week={week}&userType=student&groupId={group_id}"
             data = await self.fetch_json(session, url)
@@ -472,22 +487,40 @@ class ScheduleParser:
     async def process_group_batch(self, session: aiohttp.ClientSession, group_batch: List[str],
                                 weeks: List[int], semaphore: asyncio.Semaphore,
                                 progress_bar: tqdm) -> int:
-        """Process a batch of groups for all weeks"""
+        """Process a batch of groups for all weeks - fully parallel"""
         lessons_count = 0
 
+        # Create all tasks for this batch
+        tasks = []
         for group_id in group_batch:
             for week in weeks:
-                lessons = await self.fetch_group_timetable(session, group_id, week, semaphore)
-                if lessons:
-                    for lesson in lessons:
-                        try:
-                            self.db.insert_schedule_lesson(lesson, self.current_year_id)
-                            lessons_count += 1
-                        except Exception as e:
-                            logger.warning(f"Failed to insert lesson {lesson.get('id', 'unknown')}: {e}")
+                task = self.fetch_group_timetable(session, group_id, week, semaphore)
+                tasks.append((group_id, week, task))
 
-                progress_bar.update(1)
+        # Execute all tasks in parallel
+        results = await asyncio.gather(*[task for _, _, task in tasks], return_exceptions=True)
 
+        # Process results with database transaction
+        cursor = self.db.connection.cursor()
+        cursor.execute("BEGIN TRANSACTION")
+
+        for i, result in enumerate(results):
+            progress_bar.update(1)
+
+            if isinstance(result, Exception):
+                logger.warning(f"Failed to fetch for group {tasks[i][0]}, week {tasks[i][1]}: {result}")
+                continue
+
+            if result:  # lessons list
+                for lesson in result:
+                    try:
+                        self.db.insert_schedule_lesson(lesson, self.current_year_id)
+                        lessons_count += 1
+                    except Exception as e:
+                        if "FOREIGN KEY" not in str(e):
+                            logger.warning(f"Failed to insert lesson: {e}")
+
+        cursor.execute("COMMIT")
         return lessons_count
 
     async def scrape_full_semester(self) -> None:
@@ -502,7 +535,18 @@ class ScheduleParser:
         # Clear old data for current year
         self.db.clear_old_data(self.current_year_id)
 
-        async with aiohttp.ClientSession() as session:
+        # Create session with optimized connection pooling
+        connector = aiohttp.TCPConnector(
+            limit=CONNECTION_LIMIT,
+            limit_per_host=CONNECTION_LIMIT_PER_HOST,
+            ttl_dns_cache=300,
+            enable_cleanup_closed=True,
+            force_close=False,
+            keepalive_timeout=30
+        )
+
+        timeout = aiohttp.ClientTimeout(total=30, connect=5, sock_read=20)
+        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
             # Authenticate
             if not await self.auth.authenticate(session):
                 logger.error("Authentication failed, cannot continue")
@@ -545,8 +589,9 @@ class ScheduleParser:
                     if (i // BATCH_SIZE + 1) % 5 == 0:  # Log more frequently
                         logger.info(f"Processed {i + len(batch)} groups, {total_lessons} lessons inserted")
 
-                    # Small delay between batches (reduced)
-                    await asyncio.sleep(0.2)
+                    # Minimal delay between batches only if needed
+                    if i % 10 == 0 and i > 0:  # Every 10 batches
+                        await asyncio.sleep(0.1)
 
             finally:
                 progress_bar.close()

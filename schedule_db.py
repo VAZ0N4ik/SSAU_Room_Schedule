@@ -426,20 +426,33 @@ class ScheduleDatabase:
             if lesson_data.get('conference') and lesson_data['conference'].get('url'):
                 conference_url = lesson_data['conference']['url']
 
-            # Insert schedule entry
+            # Check if schedule entry already exists
             self.cursor.execute('''
-                INSERT OR REPLACE INTO schedule (
-                    lesson_id, week_number, weekday_id, time_slot_id,
-                    discipline_id, lesson_type_id, room_id, building_id,
-                    is_online, conference_url, comment, year_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                lesson_data['id'], week_number, weekday_id, time_slot_id,
-                discipline_id, lesson_type_id, room_id, building_id,
-                is_online, conference_url, lesson_data.get('comment', ''), year_id
-            ))
+                SELECT id FROM schedule
+                WHERE lesson_id = ? AND week_number = ? AND weekday_id = ?
+                  AND time_slot_id = ? AND year_id = ?
+            ''', (lesson_data['id'], week_number, weekday_id, time_slot_id, year_id))
 
-            schedule_id = self.cursor.lastrowid
+            existing = self.cursor.fetchone()
+
+            if existing:
+                # Use existing schedule entry
+                schedule_id = existing['id']
+            else:
+                # Insert new schedule entry
+                self.cursor.execute('''
+                    INSERT INTO schedule (
+                        lesson_id, week_number, weekday_id, time_slot_id,
+                        discipline_id, lesson_type_id, room_id, building_id,
+                        is_online, conference_url, comment, year_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    lesson_data['id'], week_number, weekday_id, time_slot_id,
+                    discipline_id, lesson_type_id, room_id, building_id,
+                    is_online, conference_url, lesson_data.get('comment', ''), year_id
+                ))
+
+                schedule_id = self.cursor.lastrowid
 
             # Insert groups
             for group in lesson_data['groups']:
@@ -612,7 +625,8 @@ class ScheduleDatabase:
             LEFT JOIN buildings b ON s.building_id = b.id
             WHERE b.name = ? AND r.room_number = ? AND s.week_number = ?
                   AND w.name = ? AND s.year_id = ?
-            GROUP BY s.id
+            GROUP BY s.lesson_id, s.week_number, w.name, ts.begin_time, ts.end_time,
+                     d.name, lt.name, s.is_online, s.conference_url, s.comment
             ORDER BY ts.begin_time
         '''
 
@@ -657,6 +671,25 @@ class ScheduleDatabase:
         """Get all buildings"""
         self.cursor.execute("SELECT * FROM buildings ORDER BY name")
         return [dict(row) for row in self.cursor.fetchall()]
+
+    def get_available_weeks(self, year_id: int = 14) -> List[int]:
+        """Get list of available weeks in the database for a specific year"""
+        self.cursor.execute(
+            "SELECT DISTINCT week_number FROM schedule WHERE year_id = ? ORDER BY week_number",
+            (year_id,)
+        )
+        return [row['week_number'] for row in self.cursor.fetchall()]
+
+    def get_week_range(self, year_id: int = 14) -> Tuple[int, int]:
+        """Get min and max week numbers available in the database"""
+        self.cursor.execute(
+            "SELECT MIN(week_number) as min_week, MAX(week_number) as max_week FROM schedule WHERE year_id = ?",
+            (year_id,)
+        )
+        result = self.cursor.fetchone()
+        if result and result['min_week'] is not None:
+            return (result['min_week'], result['max_week'])
+        return (1, 17)  # Default fallback
 
     def get_stats(self) -> Dict[str, int]:
         """Get database statistics"""
