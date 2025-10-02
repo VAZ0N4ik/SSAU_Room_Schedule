@@ -466,10 +466,8 @@ def get_admin_keyboard():
     return InlineKeyboardMarkup(keyboard)
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Start the conversation"""
-    await track_user_activity(update)
-
+async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, greeting: str = None) -> int:
+    """Show main menu to user"""
     user = update.effective_user
     user_id = update.effective_user.id
 
@@ -493,14 +491,37 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if user_db.is_admin(user_id):
         keyboard.append(["👑 Панель администратора"])
 
+    if greeting is None:
+        greeting = "Выбери, что ты хочешь сделать:"
+
     await update.message.reply_text(
-        f"Привет, {user.first_name}! 👋\n\n"
-        "Я помогу тебе найти информацию о расписании аудиторий.\n"
-        "Выбери, что ты хочешь сделать:",
+        greeting,
         reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
     )
 
     return SELECTING_ACTION
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Start the conversation"""
+    await track_user_activity(update)
+
+    user = update.effective_user
+    greeting = f"Привет, {user.first_name}! 👋\n\n" \
+               "Я помогу тебе найти информацию о расписании аудиторий.\n" \
+               "Выбери, что ты хочешь сделать:"
+
+    return await show_main_menu(update, context, greeting)
+
+
+async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Show menu (same as start but without greeting)"""
+    await track_user_activity(update)
+
+    greeting = "Главное меню:\n" \
+               "Выбери, что ты хочешь сделать:"
+
+    return await show_main_menu(update, context, greeting)
 
 
 async def select_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -941,6 +962,37 @@ async def handle_admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
         return ADMIN_MENU
 
+    elif query.data == "user_stats":
+        # Get user statistics
+        stats = user_db.get_user_stats()
+
+        stats_text = (
+            "📊 *Статистика пользователей*\n\n"
+            f"👥 Всего пользователей: {stats['total']}\n"
+            f"🟢 Активных (30 дней): {stats['active_30_days']}\n"
+            f"🔔 С включенными уведомлениями: {stats['with_notifications']}\n"
+            f"👑 Администраторов: {stats['admins']}\n"
+        )
+
+        await query.edit_message_text(
+            stats_text,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ Назад", callback_data="back_to_admin")
+            ]])
+        )
+        return ADMIN_MENU
+
+    elif query.data == "broadcast":
+        # Start broadcast flow
+        await query.edit_message_text(
+            "📢 *Отправка уведомления*\n\n"
+            "Введите текст уведомления, которое будет отправлено всем пользователям.\n"
+            "Используйте /cancel для отмены.",
+            parse_mode="Markdown"
+        )
+        return ADMIN_BROADCAST
+
     elif query.data == "back_to_admin":
         await query.edit_message_text(
             "👑 *Панель администратора*\n\n"
@@ -950,7 +1002,116 @@ async def handle_admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
         return ADMIN_MENU
 
-    # Handle other admin functions similarly to original
+    elif query.data == "back_to_menu":
+        # Return to main menu
+        user_id = update.effective_user.id
+        keyboard = [
+            ["1. Посмотреть расписание аудитории"],
+            ["2. Найти свободные аудитории (на одну пару)"],
+            ["3. Найти свободные аудитории (на несколько пар)"]
+        ]
+
+        if user_db.is_admin(user_id):
+            keyboard.append(["👑 Панель администратора"])
+
+        await query.message.reply_text(
+            "Выбери, что ты хочешь сделать:",
+            reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
+        )
+        await query.edit_message_text("Возвращаемся в главное меню...")
+        return SELECTING_ACTION
+
+    return ADMIN_MENU
+
+
+async def handle_admin_broadcast_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle broadcast message text input"""
+    await track_user_activity(update)
+
+    text = update.message.text
+    context.user_data["broadcast_text"] = text
+
+    # Get user count for confirmation
+    users = user_db.get_all_users()
+    user_count = len(users)
+
+    keyboard = [
+        [InlineKeyboardButton("✅ Да, отправить", callback_data="confirm_broadcast")],
+        [InlineKeyboardButton("❌ Отменить", callback_data="cancel_broadcast")]
+    ]
+
+    await update.message.reply_text(
+        f"📢 *Подтверждение отправки*\n\n"
+        f"Текст уведомления:\n{text}\n\n"
+        f"Будет отправлено *{user_count}* пользователям.\n\n"
+        f"Подтвердите отправку:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return ADMIN_CONFIRM_BROADCAST
+
+
+async def handle_admin_broadcast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle broadcast confirmation"""
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "confirm_broadcast":
+        broadcast_text = context.user_data.get("broadcast_text")
+        if not broadcast_text:
+            await query.edit_message_text("❌ Ошибка: текст уведомления не найден.")
+            return ConversationHandler.END
+
+        # Get all users
+        users = user_db.get_all_users()
+        sent_count = 0
+        failed_count = 0
+
+        await query.edit_message_text(
+            f"📤 Отправка уведомления {len(users)} пользователям...\n"
+            "Пожалуйста, подождите."
+        )
+
+        # Send to all users
+        for user in users:
+            try:
+                await context.bot.send_message(
+                    chat_id=user['user_id'],
+                    text=f"📢 *Уведомление от администратора*\n\n{broadcast_text}",
+                    parse_mode="Markdown"
+                )
+                sent_count += 1
+                # Small delay to avoid hitting rate limits
+                await asyncio.sleep(0.05)
+            except Exception as e:
+                logger.error(f"Failed to send broadcast to user {user['user_id']}: {e}")
+                failed_count += 1
+
+        # Show results
+        result_text = (
+            f"✅ *Рассылка завершена*\n\n"
+            f"Отправлено: {sent_count}\n"
+            f"Не удалось отправить: {failed_count}"
+        )
+
+        await query.message.reply_text(
+            result_text,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ Назад в панель", callback_data="back_to_admin")
+            ]])
+        )
+        return ADMIN_MENU
+
+    elif query.data == "cancel_broadcast":
+        await query.edit_message_text(
+            "❌ Рассылка отменена.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ Назад в панель", callback_data="back_to_admin")
+            ]])
+        )
+        return ADMIN_MENU
+
     return ADMIN_MENU
 
 
@@ -977,6 +1138,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "Этот бот поможет вам найти информацию о расписании аудиторий СГАУ.\n\n"
         "*Доступные команды:*\n"
         "/start - Начать работу с ботом\n"
+        "/menu - Показать главное меню\n"
         "/help - Показать это сообщение\n"
         "/cancel - Отменить текущую операцию\n\n"
         "*Возможности:*\n"
@@ -1000,6 +1162,7 @@ def main() -> None:
     conv_handler = ConversationHandler(
         entry_points=[
             CommandHandler("start", start),
+            CommandHandler("menu", menu),
         ],
         states={
             SELECTING_ACTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, select_action)],
@@ -1011,9 +1174,13 @@ def main() -> None:
             SELECT_TIME_END: [CallbackQueryHandler(select_time_end)],
             HANDLE_RESULTS: [CallbackQueryHandler(handle_results_navigation)],
             ADMIN_MENU: [CallbackQueryHandler(handle_admin_menu)],
+            ADMIN_BROADCAST: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_broadcast_text)],
+            ADMIN_CONFIRM_BROADCAST: [CallbackQueryHandler(handle_admin_broadcast_confirm)],
         },
         fallbacks=[
             CommandHandler("cancel", cancel),
+            CommandHandler("start", start),
+            CommandHandler("menu", menu),
         ],
     )
 
