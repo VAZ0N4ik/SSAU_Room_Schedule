@@ -146,6 +146,23 @@ def get_time_keyboard():
     return InlineKeyboardMarkup(keyboard)
 
 
+def get_end_time_keyboard(start_index: int):
+    """Create keyboard with end time options starting from the selected start time"""
+    keyboard = []
+    class_periods = get_class_periods()
+
+    # Show only periods from start_index onwards
+    for i in range(start_index, len(class_periods)):
+        label, start_time, end_time = class_periods[i]
+        keyboard.append([InlineKeyboardButton(
+            label,
+            callback_data=f"endtime_{end_time}"
+        )])
+
+    keyboard.append([InlineKeyboardButton("Отмена", callback_data="cancel")])
+    return InlineKeyboardMarkup(keyboard)
+
+
 def get_buildings_keyboard(highlight_building=None):
     """Create keyboard with building options using new database"""
     buildings = schedule_db.get_buildings()
@@ -762,13 +779,54 @@ async def select_time_start(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
         return HANDLE_RESULTS
     else:
-        # For time range, continue to end time selection
-        # (Implementation similar to original, but using new database)
+        # For time range, show keyboard to select end time
+        class_periods = get_class_periods()
+        start_index = None
+
+        # Find the index of the selected start time
+        for i, (label, begin, end) in enumerate(class_periods):
+            if begin == start_time:
+                start_index = i
+                break
+
+        if start_index is None:
+            await query.edit_message_text("Ошибка при определении начальной пары.")
+            return ConversationHandler.END
+
         await query.edit_message_text(
-            "Выберите конечную пару (функция будет доработана в следующих версиях):",
-            reply_markup=get_results_keyboard(context)
+            f"Начальная пара: {class_periods[start_index][0]}\n\nТеперь выберите конечную пару:",
+            reply_markup=get_end_time_keyboard(start_index)
         )
-        return HANDLE_RESULTS
+        return SELECT_TIME_END
+
+
+async def select_time_end(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle end time selection for time range"""
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "cancel":
+        await query.edit_message_text("Операция отменена.")
+        return ConversationHandler.END
+
+    # Extract end time from callback data
+    parts = query.data.split("_")
+    end_time = parts[1]
+
+    # Get data from context
+    building = context.user_data["building"]
+    date = context.user_data["date"]
+    start_time = context.user_data["start_time"]
+    academic_week = context.user_data["academic_week"]
+
+    # Find available rooms for the time range
+    available_rooms = find_available_rooms_new(building, date, start_time, end_time, academic_week)
+
+    await query.edit_message_text(
+        available_rooms,
+        reply_markup=get_results_keyboard(context)
+    )
+    return HANDLE_RESULTS
 
 
 # Navigation handlers
@@ -950,6 +1008,7 @@ def main() -> None:
             SELECT_WEEK: [CallbackQueryHandler(select_week)],
             SELECT_DAY: [CallbackQueryHandler(select_day)],
             SELECT_TIME_START: [CallbackQueryHandler(select_time_start)],
+            SELECT_TIME_END: [CallbackQueryHandler(select_time_end)],
             HANDLE_RESULTS: [CallbackQueryHandler(handle_results_navigation)],
             ADMIN_MENU: [CallbackQueryHandler(handle_admin_menu)],
         },
