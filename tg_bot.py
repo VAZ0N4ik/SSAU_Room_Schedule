@@ -85,7 +85,7 @@ async def track_user_activity(update: Update):
 
 
 def calculate_current_academic_week():
-    """Calculate the current academic week based on semester start"""
+    """Calculate the current academic week based on semester start with modular arithmetic"""
     today = datetime.now()
     semester_start_date = datetime.strptime(SEMESTER_START, "%Y-%m-%d")
 
@@ -93,8 +93,28 @@ def calculate_current_academic_week():
     if delta_days < 0:
         return 1
 
-    current_week = (delta_days // 7) + 1
-    return current_week
+    # Get available weeks from database
+    available_weeks = schedule_db.get_available_weeks(year_id=14)
+
+    if not available_weeks:
+        # Fallback to simple calculation if no data
+        current_week = (delta_days // 7) + 1
+        return current_week
+
+    # Get week range
+    min_week, max_week = min(available_weeks), max(available_weeks)
+    total_weeks = max_week - min_week + 1
+
+    # Calculate week with modular arithmetic
+    raw_week = (delta_days // 7) + 1
+
+    # Map to actual week range using modulo
+    if raw_week > max_week:
+        # Use modular arithmetic to cycle through weeks
+        normalized_week = ((raw_week - min_week) % total_weeks) + min_week
+        return normalized_week
+
+    return raw_week
 
 
 def get_class_periods():
@@ -253,7 +273,8 @@ def get_schedule_for_day_new(building_name: str, room_number: str, date_str: str
     weekday_name = WEEKDAY_TRANSLATION[date_obj.weekday()]
 
     try:
-        lessons = schedule_db.get_room_schedule(building_name, room_number, academic_week, weekday_name)
+        # Pass year_id explicitly (14 is current year)
+        lessons = schedule_db.get_room_schedule(building_name, room_number, academic_week, weekday_name, 14)
 
         # Format response
         date_formatted = date_obj.strftime("%d.%m.%Y")
@@ -303,7 +324,7 @@ def find_available_rooms_new(building_name: str, date_str: str, begin_time: str,
 
     try:
         available_rooms = schedule_db.get_available_rooms(
-            building_name, academic_week, weekday_name, begin_time, end_time
+            building_name, academic_week, weekday_name, begin_time, end_time, 14
         )
 
         # Format response
@@ -343,7 +364,7 @@ def find_available_rooms_new(building_name: str, date_str: str, begin_time: str,
 
 
 def get_academic_week(date_str: str, semester_start: str = SEMESTER_START) -> Optional[int]:
-    """Calculate academic week number from a date"""
+    """Calculate academic week number from a date with validation"""
     try:
         date_obj = datetime.strptime(date_str, "%Y-%m-%d")
         semester_start_date = datetime.strptime(semester_start, "%Y-%m-%d")
@@ -352,7 +373,24 @@ def get_academic_week(date_str: str, semester_start: str = SEMESTER_START) -> Op
         if delta_days < 0:
             return None
 
-        return (delta_days // 7) + 1
+        raw_week = (delta_days // 7) + 1
+
+        # Get available weeks from database for validation
+        available_weeks = schedule_db.get_available_weeks(year_id=14)
+
+        if not available_weeks:
+            return raw_week
+
+        # Get week range
+        min_week, max_week = min(available_weeks), max(available_weeks)
+        total_weeks = max_week - min_week + 1
+
+        # Map to actual week range using modulo if needed
+        if raw_week > max_week:
+            normalized_week = ((raw_week - min_week) % total_weeks) + min_week
+            return normalized_week
+
+        return raw_week
     except Exception:
         return None
 
