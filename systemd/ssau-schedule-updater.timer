@@ -1,0 +1,21 @@
+[Unit]
+Description=SSAU Schedule Updater Timer
+Documentation=https://github.com/your-repo/SSAU_Room_Schedule
+Requires=ssau-schedule-updater.service
+
+[Timer]
+# Run daily at 2:00 AM
+OnCalendar=*-*-* 02:00:00
+
+# If the system was off when the timer should have run, run it as soon as possible
+Persistent=true
+
+# Add random delay up to 30 minutes to avoid server overload
+RandomizedDelaySec=1800
+
+# Don't start if the service is already running
+RefuseManualStart=false
+RefuseManualStop=false
+
+[Install]
+WantedBy=timers.target

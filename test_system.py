@@ -196,8 +196,8 @@ def test_systemd_files():
     """Test systemd service files exist and are valid"""
     print("\n⚙️  Testing systemd files...")
 
-    service_file = "ssau-schedule-updater.service"
-    timer_file = "ssau-schedule-updater.timer"
+    service_file = "systemd/ssau-schedule-updater.service"
+    timer_file = "systemd/ssau-schedule-updater.timer"
     install_script = "install_service.sh"
 
     files_ok = True

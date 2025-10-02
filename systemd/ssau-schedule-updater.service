@@ -1,0 +1,42 @@
+[Unit]
+Description=SSAU Schedule Updater Service
+Documentation=https://github.com/your-repo/SSAU_Room_Schedule
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ssau-schedule
+Group=ssau-schedule
+WorkingDirectory=/opt/ssau-schedule
+Environment=PATH=/opt/ssau-schedule/.venv/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=/opt/ssau-schedule/.env
+ExecStart=/opt/ssau-schedule/.venv/bin/python /opt/ssau-schedule/schedule_updater.py --once
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ssau-schedule-updater
+
+# Security settings
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/ssau-schedule /var/log
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+
+# Resource limits
+MemoryMax=2G
+CPUQuota=200%
+TasksMax=100
+
+# Timeout settings
+TimeoutStartSec=3600
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
