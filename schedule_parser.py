@@ -27,11 +27,14 @@ BASE_URL = "https://ssau.ru/rasp"
 API_URL = "https://cabinet.ssau.ru/api/timetable/get-timetable"
 AUTH_URL = "https://cabinet.ssau.ru/login"
 CACHE_DIR = "cache"
-MAX_CONCURRENT_REQUESTS = 30  # Maximum concurrent requests
-REQUEST_DELAY = 0.01  # Minimal delay between requests
-BATCH_SIZE = 50  # Process 50 groups at once
-CONNECTION_LIMIT = 100  # Total connection pool limit
-CONNECTION_LIMIT_PER_HOST = 30  # Per-host connection limit
+MAX_CONCURRENT_REQUESTS = 3  # Reduced to avoid rate limiting
+REQUEST_DELAY = 1.5  # Base delay between requests (seconds)
+BATCH_SIZE = 10  # Smaller batches for stability
+CONNECTION_LIMIT = 20  # Total connection pool limit
+CONNECTION_LIMIT_PER_HOST = 5  # Per-host connection limit
+MIN_DELAY = 0.5  # Minimum delay between requests
+MAX_DELAY = 30  # Maximum delay on rate limit
+RATE_LIMIT_BACKOFF_MULTIPLIER = 2.0  # Exponential backoff multiplier
 
 # Create cache directory if it doesn't exist
 os.makedirs(CACHE_DIR, exist_ok=True)
@@ -58,6 +61,46 @@ class SSAUAuth:
         self.username = os.getenv("SSAU_USERNAME")
         self.password = os.getenv("SSAU_PASSWORD")
 
+    async def warmup_session(self, session: aiohttp.ClientSession) -> bool:
+        """Warm up session by visiting main site first to get cookies"""
+        warmup_urls = [
+            "https://ssau.ru",
+            "https://cabinet.ssau.ru",
+        ]
+
+        headers = {
+            **HEADERS,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+            "Upgrade-Insecure-Requests": "1",
+        }
+
+        for url in warmup_urls:
+            try:
+                logger.info(f"Warming up session with {url}...")
+                async with session.get(url, headers=headers, allow_redirects=True) as response:
+                    if response.status == 200:
+                        # Read body to complete the request
+                        await response.text()
+                        logger.info(f"✅ Warmed up with {url} (status: {response.status})")
+                    else:
+                        logger.warning(f"Warmup request to {url} returned {response.status}")
+
+                # Small delay between warmup requests
+                await asyncio.sleep(1)
+
+            except Exception as e:
+                logger.warning(f"Warmup request to {url} failed: {e}")
+
+        # Log cookies after warmup
+        cookies = {cookie.key: cookie.value[:20] + "..." for cookie in session.cookie_jar}
+        logger.info(f"Cookies after warmup: {list(cookies.keys())}")
+
+        return True
+
     async def get_session_by_login(self, session: aiohttp.ClientSession) -> bool:
         """Get Laravel session by programmatic login"""
         if not self.username or not self.password:
@@ -67,9 +110,24 @@ class SSAUAuth:
         try:
             logger.info("Starting programmatic authentication...")
 
+            # Step 0: Warm up session first
+            await self.warmup_session(session)
+            await asyncio.sleep(2)  # Wait after warmup
+
             # Step 1: Get login page and extract CSRF token
             login_url = "https://cabinet.ssau.ru/login"
-            async with session.get(login_url) as response:
+
+            login_headers = {
+                **HEADERS,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "same-origin",
+                "Referer": "https://cabinet.ssau.ru/",
+                "Upgrade-Insecure-Requests": "1",
+            }
+
+            async with session.get(login_url, headers=login_headers, allow_redirects=True) as response:
                 if response.status != 200:
                     logger.error(f"Failed to get login page: {response.status}")
                     return False
@@ -269,6 +327,53 @@ class SSAUAuth:
         return {}
 
 
+class AdaptiveRateLimiter:
+    """Adaptive rate limiter that adjusts delays based on server responses"""
+
+    def __init__(self, initial_delay: float = REQUEST_DELAY):
+        self.current_delay = initial_delay
+        self.min_delay = MIN_DELAY
+        self.max_delay = MAX_DELAY
+        self.consecutive_success = 0
+        self.consecutive_429 = 0
+        self._lock = asyncio.Lock()
+
+    async def wait(self):
+        """Wait for the current delay period"""
+        # Add jitter to avoid thundering herd
+        jitter = random.uniform(0.8, 1.2)
+        await asyncio.sleep(self.current_delay * jitter)
+
+    async def on_success(self):
+        """Called when a request succeeds"""
+        async with self._lock:
+            self.consecutive_success += 1
+            self.consecutive_429 = 0
+
+            # Gradually decrease delay after consecutive successes
+            if self.consecutive_success >= 10:
+                self.current_delay = max(self.min_delay, self.current_delay * 0.9)
+                self.consecutive_success = 0
+                logger.debug(f"Decreased delay to {self.current_delay:.2f}s")
+
+    async def on_rate_limit(self):
+        """Called when we get a 429 response"""
+        async with self._lock:
+            self.consecutive_429 += 1
+            self.consecutive_success = 0
+
+            # Exponential backoff with cap
+            self.current_delay = min(
+                self.max_delay,
+                self.current_delay * RATE_LIMIT_BACKOFF_MULTIPLIER
+            )
+            logger.warning(f"Rate limited! Increased delay to {self.current_delay:.2f}s "
+                         f"(consecutive 429s: {self.consecutive_429})")
+
+    def get_current_delay(self) -> float:
+        return self.current_delay
+
+
 class ScheduleParser:
     """Enhanced schedule parser with full semester support"""
 
@@ -278,6 +383,7 @@ class ScheduleParser:
         self.auth = SSAUAuth()
         self.current_year_id = None
         self.total_weeks = 18  # Full semester
+        self.rate_limiter = AdaptiveRateLimiter()
 
     async def get_current_year_id(self, session: aiohttp.ClientSession) -> Optional[int]:
         """Get current academic year ID from API"""
@@ -319,14 +425,19 @@ class ScheduleParser:
         logger.error(f"All {retries} attempts failed for {url}")
         return None
 
-    async def fetch_json(self, session: aiohttp.ClientSession, url: str, retries: int = 2) -> Optional[Dict[str, Any]]:
-        """Fetch JSON data with retries - optimized for speed"""
+    async def fetch_json(self, session: aiohttp.ClientSession, url: str, retries: int = 5) -> Optional[Dict[str, Any]]:
+        """Fetch JSON data with retries and adaptive rate limiting"""
         for attempt in range(retries):
             try:
-                timeout = aiohttp.ClientTimeout(total=10, connect=3, sock_read=7)
+                # Wait using adaptive rate limiter
+                await self.rate_limiter.wait()
+
+                timeout = aiohttp.ClientTimeout(total=15, connect=5, sock_read=10)
                 async with session.get(url, headers=HEADERS, cookies=self.auth.get_cookies(), timeout=timeout) as response:
                     if response.status == 200:
-                        return await response.json()
+                        data = await response.json()
+                        await self.rate_limiter.on_success()
+                        return data
                     elif response.status == 401:
                         logger.warning("Authentication expired, re-authenticating...")
                         if await self.auth.authenticate(session):
@@ -335,20 +446,33 @@ class ScheduleParser:
                             logger.error("Re-authentication failed")
                             return None
                     elif response.status == 429:  # Rate limited
-                        wait_time = min(2 ** attempt, 5)  # Max 5 seconds
-                        logger.warning(f"Rate limited, waiting {wait_time}s")
-                        await asyncio.sleep(wait_time)
+                        await self.rate_limiter.on_rate_limit()
+                        # Additional wait time from Retry-After header if present
+                        retry_after = response.headers.get('Retry-After')
+                        if retry_after:
+                            try:
+                                wait_time = int(retry_after)
+                                logger.info(f"Server requested wait: {wait_time}s")
+                                await asyncio.sleep(wait_time)
+                            except ValueError:
+                                pass
+                        continue
+                    elif response.status == 403:
+                        logger.warning(f"Forbidden (403) for {url}, may need to re-authenticate")
+                        # Try warming up session again
+                        await self.auth.warmup_session(session)
+                        await asyncio.sleep(3)
                         continue
                     else:
                         logger.warning(f"HTTP {response.status} for {url}")
             except asyncio.TimeoutError:
                 logger.warning(f"Timeout on attempt {attempt + 1} for {url}")
                 if attempt < retries - 1:
-                    await asyncio.sleep(0.5)  # Quick retry
+                    await asyncio.sleep(2)  # Longer retry delay
             except Exception as e:
                 logger.warning(f"Attempt {attempt + 1} failed for {url}: {e}")
                 if attempt < retries - 1:
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(2)
 
         logger.error(f"All {retries} attempts failed for {url}")
         return None
@@ -473,10 +597,7 @@ class ScheduleParser:
                                   week: int, semaphore: asyncio.Semaphore) -> Optional[List[Dict[str, Any]]]:
         """Fetch timetable for a specific group and week"""
         async with semaphore:
-            # Minimal delay only when necessary
-            if random.random() < 0.1:  # 10% chance of delay to avoid rate limits
-                await asyncio.sleep(REQUEST_DELAY)
-
+            # Rate limiting is handled by fetch_json via AdaptiveRateLimiter
             url = f"{API_URL}?yearId={self.current_year_id}&week={week}&userType=student&groupId={group_id}"
             data = await self.fetch_json(session, url)
 
@@ -585,13 +706,14 @@ class ScheduleParser:
                         logger.error(f"Database commit error: {e}")
                         self.db.connection.rollback()
 
-                    # Log progress
-                    if (i // BATCH_SIZE + 1) % 5 == 0:  # Log more frequently
-                        logger.info(f"Processed {i + len(batch)} groups, {total_lessons} lessons inserted")
+                    # Log progress with current rate limiter state
+                    current_delay = self.rate_limiter.get_current_delay()
+                    logger.info(f"Batch {i // BATCH_SIZE + 1} done: {total_lessons} lessons, "
+                              f"current delay: {current_delay:.2f}s")
 
-                    # Minimal delay between batches only if needed
-                    if i % 10 == 0 and i > 0:  # Every 10 batches
-                        await asyncio.sleep(0.1)
+                    # Delay between batches (based on rate limiter + fixed pause)
+                    batch_pause = max(2.0, current_delay)
+                    await asyncio.sleep(batch_pause)
 
             finally:
                 progress_bar.close()
